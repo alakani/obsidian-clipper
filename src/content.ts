@@ -12,6 +12,7 @@ import { saveFile } from './utils/file-utils';
 import { debugLog } from './utils/debug';
 import { updateSidebarWidth, addResizeHandle, cleanupResizeHandlers } from './utils/iframe-resize';
 import { parseForClip } from './utils/clip-utils';
+import { getFullChatGPTConversation } from './utils/chatgpt-conversation';
 
 declare global {
 	interface Window {
@@ -213,9 +214,17 @@ declare global {
 					selectedHtml = serializeChildren(div);
 				}
 
+				// ChatGPT only mounts the turns near the viewport, so collect the
+				// whole conversation first. Falls back to the live page on failure.
+				const sourceDocument = await getFullChatGPTConversation(document)
+					.catch((error: unknown) => {
+						console.warn('[Obsidian Clipper] Could not collect full ChatGPT conversation:', error);
+						return null;
+					}) ?? document;
+
 				// Use parseAsync to ensure async variables like {{transcript}} are available.
 				// If it hangs (e.g. another extension has corrupted fetch), fall back to sync parse.
-				const defuddle = new Defuddle(document, { url: document.URL });
+				const defuddle = new Defuddle(sourceDocument, { url: document.URL });
 				const parseTimeout = new Promise<never>((_, reject) =>
 					setTimeout(() => reject(new Error('parseAsync timeout')), 8000)
 				);
@@ -228,7 +237,7 @@ declare global {
 				// Create a new DOMParser
 				const parser = new DOMParser();
 				// Parse the document's HTML
-				const doc = parser.parseFromString(document.documentElement.outerHTML, 'text/html');
+				const doc = parser.parseFromString(sourceDocument.documentElement.outerHTML, 'text/html');
 
 				// Remove all script and style elements
 				doc.querySelectorAll('script, style').forEach(el => el.remove());
