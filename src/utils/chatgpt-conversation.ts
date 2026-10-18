@@ -17,7 +17,6 @@ export interface ScrollView {
 	setScrollTop(top: number): void;
 	getScrollHeight(): number;
 	getClientHeight(): number;
-	getTurnHeight(turn: Element): number;
 }
 
 export interface CollectOptions {
@@ -27,6 +26,9 @@ export interface CollectOptions {
 	quietMs?: number;
 	// Upper bound on waiting for a single step to render.
 	maxStepWaitMs?: number;
+	// How long to wait at the top for older history to load before deciding
+	// the start of the conversation has been reached.
+	topWaitMs?: number;
 	// Upper bound for the whole pass; whatever was collected is used after it.
 	maxTotalMs?: number;
 }
@@ -35,7 +37,8 @@ const DEFAULTS: Required<CollectOptions> = {
 	stepFraction: 0.75,
 	quietMs: 150,
 	maxStepWaitMs: 1500,
-	maxTotalMs: 60000,
+	topWaitMs: 3000,
+	maxTotalMs: 90000,
 };
 
 export function isChatGPTUrl(url: string): boolean {
@@ -138,21 +141,26 @@ export function createScrollView(container: Element): ScrollView {
 		setScrollTop: (top: number) => container.scrollTo({ top, behavior: 'instant' as ScrollBehavior }),
 		getScrollHeight: () => container.scrollHeight,
 		getClientHeight: () => container.clientHeight,
-		getTurnHeight: (turn: Element) => turn.getBoundingClientRect().height,
 	};
 }
 
-// True when some turns are not mounted, judged by comparing the height of
-// the mounted turns to the scrollable height.
-export function hasUnmountedTurns(doc: Document, view: ScrollView): boolean {
-	const mounted = getMountedTurns(doc);
-	if (mounted.length === 0) return false;
-	const clientHeight = view.getClientHeight();
-	const scrollHeight = view.getScrollHeight();
-	if (scrollHeight <= clientHeight) return false;
-	const mountedHeight = mounted.reduce((sum, turn) => sum + view.getTurnHeight(turn), 0);
-	// Allow a viewport of slack for the composer, header and spacing.
-	return mountedHeight < scrollHeight - clientHeight;
+// Whether the conversation extends beyond the visible area. Page height can't
+// show whether turns are missing: ChatGPT first loads only the latest turns
+// and fetches older ones when the top is reached, so a partly loaded
+// conversation can look complete. Any conversation that scrolls gets a pass.
+export function isScrollable(view: ScrollView): boolean {
+	return view.getScrollHeight() > view.getClientHeight() + 1;
+}
+
+// Polls until `changed()` returns true (resolves true) or `maxMs` passes
+// (resolves false).
+export async function waitForChange(changed: () => boolean, maxMs: number, intervalMs = 250): Promise<boolean> {
+	const end = Date.now() + maxMs;
+	while (Date.now() < end) {
+		await new Promise(resolve => setTimeout(resolve, Math.min(intervalMs, maxMs)));
+		if (changed()) return true;
+	}
+	return false;
 }
 
 // Resolves once the DOM under `root` has been quiet for `quietMs`, or after
@@ -199,9 +207,21 @@ export async function collectAllTurns(doc: Document, view: ScrollView, options: 
 			await settle();
 			const added = collection.capture(getMountedTurns(doc));
 			const newTop = view.getScrollTop();
-			// Stop only at the top when nothing new appeared there, since
-			// older turns can load in after reaching it.
-			if (top <= 0 && newTop <= 0 && added === 0) break;
+			if (top <= 0 && newTop <= 0 && added === 0) {
+				// Older turns are fetched once the top is reached, which can
+				// take a while and leaves the page quiet meanwhile. Stop only
+				// if nothing arrives.
+				const heightAtTop = view.getScrollHeight();
+				const arrived = await waitForChange(() =>
+					view.getScrollHeight() !== heightAtTop
+					|| view.getScrollTop() > 0
+					|| getMountedTurns(doc).some(turn => !collection.has(getTurnKey(turn))),
+				opts.topWaitMs);
+				if (!arrived) break;
+				await settle();
+				collection.capture(getMountedTurns(doc));
+				continue;
+			}
 			// Give up if scrolling has no effect (wrong container).
 			stuckSteps = newTop === top && added === 0 ? stuckSteps + 1 : 0;
 			if (stuckSteps >= 3) {
@@ -245,7 +265,7 @@ let cache: CachedConversation | null = null;
 let inFlight: Promise<Document | null> | null = null;
 
 // Returns a document with the full conversation, or null when the page
-// isn't a ChatGPT conversation or every turn is already mounted.
+// isn't a ChatGPT conversation or the conversation fits on screen.
 export function getFullChatGPTConversation(doc: Document, options: CollectOptions = {}, view?: ScrollView): Promise<Document | null> {
 	if (!isChatGPTUrl(doc.URL)) return Promise.resolve(null);
 	if (inFlight) return inFlight;
@@ -263,7 +283,7 @@ export function getFullChatGPTConversation(doc: Document, options: CollectOption
 		}
 
 		const scrollView = view ?? createScrollView(findScrollContainer(doc));
-		if (!hasUnmountedTurns(doc, scrollView)) return null;
+		if (!isScrollable(scrollView)) return null;
 
 		const started = Date.now();
 		const collection = await collectAllTurns(doc, scrollView, options);

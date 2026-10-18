@@ -9,7 +9,7 @@ import {
 	collectAllTurns,
 	getFullChatGPTConversation,
 	getMountedTurns,
-	hasUnmountedTurns,
+	isScrollable,
 	isChatGPTUrl,
 	ScrollView,
 } from './chatgpt-conversation';
@@ -55,12 +55,55 @@ function createVirtualConversation(total: number, startTop = 0) {
 		},
 		getScrollHeight: () => scrollHeight,
 		getClientHeight: () => VIEWPORT,
-		getTurnHeight: () => TURN_HEIGHT,
 	};
 	return { view, getScrollTop: () => scrollTop };
 }
 
-const fast = { quietMs: 5, maxStepWaitMs: 50, maxTotalMs: 5000 };
+// How ChatGPT behaves on a fresh page load: only the latest turns are loaded,
+// and they fill the whole scroll height. Reaching the top fetches the previous
+// batch after a delay and prepends it, keeping the visible turns in place.
+function createPaginatedConversation(total: number, { initial = 6, batch = 8, delayMs = 200 } = {}) {
+	document.body.innerHTML = '<main><div id="thread"></div><form id="composer"></form></main>';
+	const thread = document.getElementById('thread')!;
+	let firstLoaded = total - initial + 1;
+	let loading = false;
+	const loadedHeight = () => (total - firstLoaded + 1) * TURN_HEIGHT;
+	let scrollTop = loadedHeight() - VIEWPORT;
+
+	const render = () => {
+		const first = Math.max(firstLoaded, firstLoaded + Math.floor((scrollTop - OVERSCAN) / TURN_HEIGHT));
+		const last = Math.min(total, firstLoaded + Math.ceil((scrollTop + VIEWPORT + OVERSCAN) / TURN_HEIGHT) - 1);
+		let html = '';
+		for (let i = first; i <= last; i++) html += turnHtml(i);
+		thread.innerHTML = html;
+	};
+	const loadOlder = () => {
+		if (loading || firstLoaded === 1) return;
+		loading = true;
+		setTimeout(() => {
+			const count = Math.min(batch, firstLoaded - 1);
+			firstLoaded -= count;
+			scrollTop += count * TURN_HEIGHT;
+			loading = false;
+			render();
+		}, delayMs);
+	};
+	render();
+
+	const view: ScrollView = {
+		getScrollTop: () => scrollTop,
+		setScrollTop: (top: number) => {
+			scrollTop = Math.max(0, Math.min(top, loadedHeight() - VIEWPORT));
+			render();
+			if (scrollTop === 0) loadOlder();
+		},
+		getScrollHeight: () => loadedHeight(),
+		getClientHeight: () => VIEWPORT,
+	};
+	return { view };
+}
+
+const fast = { quietMs: 5, maxStepWaitMs: 50, topWaitMs: 1000, maxTotalMs: 10000 };
 
 function keysOf(turns: Element[]): string[] {
 	return turns.map(t => t.getAttribute('data-testid')!);
@@ -134,6 +177,24 @@ describe('collectAllTurns', () => {
 		expect(getScrollTop()).toBe(1700);
 	});
 
+	it('waits at the top for older turns that load late', async () => {
+		const { view } = createPaginatedConversation(40, { delayMs: 200 });
+		expect(getMountedTurns(document).length).toBe(6);
+
+		const collection = await collectAllTurns(document, view, fast);
+		expect(keysOf(collection.toArray())).toEqual(
+			Array.from({ length: 40 }, (_, i) => `conversation-turn-${i + 1}`)
+		);
+	});
+
+	it('stops at the top once no older turns arrive', async () => {
+		const { view } = createVirtualConversation(40, 1700);
+		const started = Date.now();
+		await collectAllTurns(document, view, { ...fast, topWaitMs: 300 });
+		// One wait at the top, not one per step.
+		expect(Date.now() - started).toBeLessThan(1500);
+	});
+
 	it('stops when scrolling has no effect', async () => {
 		createVirtualConversation(40, 1700);
 		const stuck: ScrollView = {
@@ -141,7 +202,6 @@ describe('collectAllTurns', () => {
 			setScrollTop: () => {},
 			getScrollHeight: () => 4000,
 			getClientHeight: () => VIEWPORT,
-			getTurnHeight: () => TURN_HEIGHT,
 		};
 		const started = Date.now();
 		await collectAllTurns(document, stuck, { ...fast, maxTotalMs: 60000 });
@@ -163,15 +223,15 @@ describe('current ChatGPT layout', () => {
 	});
 });
 
-describe('hasUnmountedTurns', () => {
-	it('is false when the whole conversation is mounted', () => {
+describe('isScrollable', () => {
+	it('is false when the conversation fits on screen', () => {
 		const { view } = createVirtualConversation(4);
-		expect(hasUnmountedTurns(document, view)).toBe(false);
+		expect(isScrollable(view)).toBe(false);
 	});
 
-	it('is true when only part of the conversation is mounted', () => {
+	it('is true when the conversation scrolls', () => {
 		const { view } = createVirtualConversation(60, 2500);
-		expect(hasUnmountedTurns(document, view)).toBe(true);
+		expect(isScrollable(view)).toBe(true);
 	});
 });
 
@@ -201,6 +261,15 @@ describe('getFullChatGPTConversation', () => {
 		expect(result.content).toContain('Answer number 60');
 		expect(result.content.indexOf('Question number 1'))
 			.toBeLessThan(result.content.indexOf('Answer number 60'));
+	});
+
+	it('collects the full conversation on a fresh page load', async () => {
+		// The loaded turns fill the page, so nothing looks missing until the
+		// top is reached and older turns are fetched.
+		const { view } = createPaginatedConversation(40);
+		const full = await getFullChatGPTConversation(document, fast, view);
+		expect(full).not.toBeNull();
+		expect(getMountedTurns(full!).length).toBe(40);
 	});
 
 	it('reuses the previous pass instead of scrolling again', async () => {
