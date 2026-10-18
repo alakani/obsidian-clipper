@@ -10,6 +10,8 @@ import {
 	getFullChatGPTConversation,
 	getMountedTurns,
 	isScrollable,
+	isCompleteRun,
+	hasHistoryLoader,
 	isChatGPTUrl,
 	ScrollView,
 } from './chatgpt-conversation';
@@ -59,22 +61,34 @@ function createVirtualConversation(total: number, startTop = 0) {
 	return { view, getScrollTop: () => scrollTop };
 }
 
-// How ChatGPT behaves on a fresh page load: only the latest turns are loaded,
-// and they fill the whole scroll height. Reaching the top fetches the previous
-// batch after a delay and prepends it, keeping the visible turns in place.
-function createPaginatedConversation(total: number, { initial = 6, batch = 8, delayMs = 200 } = {}) {
-	document.body.innerHTML = '<main><div id="thread"></div><form id="composer"></form></main>';
+// How ChatGPT behaves on a fresh page load, in its current layout: only the
+// latest exchanges are loaded and they fill the whole scroll height. A loading
+// indicator sits above them while older history remains; reaching the top
+// fetches the previous batch after a delay and prepends it, keeping the
+// visible exchanges in place. Each exchange carries a "fallback-turn-N" key
+// numbered among the loaded exchanges, renumbered as more load.
+function createPaginatedConversation(total: number, { initial = 6, batch = 8, delayMs = 200, loader = true, expands = true } = {}) {
+	document.body.innerHTML = '<main><div id="top"></div><div id="thread"></div><form id="composer"><div role="status"></div></form></main>';
+	const top = document.getElementById('top')!;
 	const thread = document.getElementById('thread')!;
 	let firstLoaded = total - initial + 1;
 	let loading = false;
+	let expanded = false;
+	const hidden: boolean[] = [];
+	let scrollCalls = 0;
 	const loadedHeight = () => (total - firstLoaded + 1) * TURN_HEIGHT;
 	let scrollTop = loadedHeight() - VIEWPORT;
 
+	const exchangeHtml = (i: number) => `<div><div data-turn-key="bbb-${i}">`
+		+ `<div data-content-search-turn-key="fallback-turn-${i - firstLoaded}">Exchange ${i}</div></div></div>`;
 	const render = () => {
-		const first = Math.max(firstLoaded, firstLoaded + Math.floor((scrollTop - OVERSCAN) / TURN_HEIGHT));
-		const last = Math.min(total, firstLoaded + Math.ceil((scrollTop + VIEWPORT + OVERSCAN) / TURN_HEIGHT) - 1);
+		top.innerHTML = loader && firstLoaded > 1 ? '<div role="status">Loading older messages</div>' : '';
+		const first = expanded ? firstLoaded
+			: Math.max(firstLoaded, firstLoaded + Math.floor((scrollTop - OVERSCAN) / TURN_HEIGHT));
+		const last = expanded ? total
+			: Math.min(total, firstLoaded + Math.ceil((scrollTop + VIEWPORT + OVERSCAN) / TURN_HEIGHT) - 1);
 		let html = '';
-		for (let i = first; i <= last; i++) html += turnHtml(i);
+		for (let i = first; i <= last; i++) html += exchangeHtml(i);
 		thread.innerHTML = html;
 	};
 	const loadOlder = () => {
@@ -92,18 +106,33 @@ function createPaginatedConversation(total: number, { initial = 6, batch = 8, de
 
 	const view: ScrollView = {
 		getScrollTop: () => scrollTop,
-		setScrollTop: (top: number) => {
-			scrollTop = Math.max(0, Math.min(top, loadedHeight() - VIEWPORT));
+		setScrollTop: (value: number) => {
+			scrollCalls++;
+			scrollTop = Math.max(0, Math.min(value, loadedHeight() - VIEWPORT));
 			render();
 			if (scrollTop === 0) loadOlder();
 		},
 		getScrollHeight: () => loadedHeight(),
 		getClientHeight: () => VIEWPORT,
+		setExpanded: (on: boolean) => {
+			if (!expands) return;
+			expanded = on;
+			setTimeout(render, 10);
+		},
+		setHidden: (on: boolean) => { hidden.push(on); },
 	};
-	return { view };
+	return { view, hidden, scrollCalls: () => scrollCalls, loadedHeight };
 }
 
-const fast = { quietMs: 5, maxStepWaitMs: 50, topWaitMs: 1000, maxTotalMs: 10000 };
+function exchangeKeys(turns: Element[]): string[] {
+	return turns.map(t => t.getAttribute('data-turn-key')!);
+}
+
+function expectedExchanges(total: number): string[] {
+	return Array.from({ length: total }, (_, i) => `bbb-${i + 1}`);
+}
+
+const fast = { quietMs: 5, maxStepWaitMs: 300, topWaitMs: 1000, probeWaitMs: 100, maxTotalMs: 10000 };
 
 function keysOf(turns: Element[]): string[] {
 	return turns.map(t => t.getAttribute('data-testid')!);
@@ -177,14 +206,35 @@ describe('collectAllTurns', () => {
 		expect(getScrollTop()).toBe(1700);
 	});
 
-	it('waits at the top for older turns that load late', async () => {
-		const { view } = createPaginatedConversation(40, { delayMs: 200 });
+	it('loads the whole history, then renders everything at once', async () => {
+		const { view, scrollCalls, loadedHeight } = createPaginatedConversation(40, { delayMs: 200 });
 		expect(getMountedTurns(document).length).toBe(6);
 
 		const collection = await collectAllTurns(document, view, fast);
-		expect(keysOf(collection.toArray())).toEqual(
-			Array.from({ length: 40 }, (_, i) => `conversation-turn-${i + 1}`)
-		);
+		expect(exchangeKeys(collection.toArray())).toEqual(expectedExchanges(40));
+		// Jumps to the top and back, rather than stepping through 40 exchanges.
+		expect(scrollCalls()).toBeLessThan(12);
+		// Back at the bottom, though history was added above.
+		expect(view.getScrollTop()).toBe(loadedHeight() - VIEWPORT);
+	});
+
+	it('loads late history when no loading indicator is shown', async () => {
+		const { view } = createPaginatedConversation(40, { delayMs: 100, loader: false });
+		const collection = await collectAllTurns(document, view, { ...fast, probeWaitMs: 400 });
+		expect(exchangeKeys(collection.toArray())).toEqual(expectedExchanges(40));
+	});
+
+	it('scrolls through when expanding does not render everything', async () => {
+		const { view, scrollCalls } = createPaginatedConversation(40, { delayMs: 50, expands: false });
+		const collection = await collectAllTurns(document, view, fast);
+		expect(exchangeKeys(collection.toArray())).toEqual(expectedExchanges(40));
+		expect(scrollCalls()).toBeGreaterThan(12);
+	});
+
+	it('hides the conversation while collecting and shows it again', async () => {
+		const { view, hidden } = createPaginatedConversation(20, { delayMs: 20 });
+		await collectAllTurns(document, view, fast);
+		expect(hidden).toEqual([true, false]);
 	});
 
 	it('stops at the top once no older turns arrive', async () => {
@@ -220,6 +270,38 @@ describe('current ChatGPT layout', () => {
 		document.querySelector('[data-turn-key="bbb-1"] [data-content-search-unit-key]')!.setAttribute('data-content-search-unit-key', 'fallback-turn-9:0:user');
 		expect(collection.capture(getMountedTurns(document))).toBe(0);
 		expect(collection.toArray().map(t => t.getAttribute('data-turn-key'))).toEqual(['bbb-1', 'bbb-2', 'bbb-3']);
+	});
+});
+
+describe('isCompleteRun', () => {
+	const exchanges = (indices: number[]) => {
+		document.body.innerHTML = indices.map(i =>
+			`<div data-turn-key="bbb-${i}"><div data-content-search-turn-key="fallback-turn-${i}"></div></div>`).join('');
+		return getMountedTurns(document);
+	};
+
+	it('accepts exchanges numbered from 0 without gaps, ending with the newest', () => {
+		expect(isCompleteRun(exchanges([0, 1, 2, 3]), 'bbb-3')).toBe(true);
+	});
+
+	it('rejects a gap, a missing start or a missing end', () => {
+		expect(isCompleteRun(exchanges([0, 1, 3]), 'bbb-3')).toBe(false);
+		expect(isCompleteRun(exchanges([1, 2, 3]), 'bbb-3')).toBe(false);
+		expect(isCompleteRun(exchanges([0, 1, 2]), 'bbb-3')).toBe(false);
+	});
+
+	it('rejects turns without index keys', () => {
+		document.body.innerHTML = '<div data-turn-key="bbb-0"></div>';
+		expect(isCompleteRun(getMountedTurns(document), 'bbb-0')).toBe(false);
+	});
+});
+
+describe('hasHistoryLoader', () => {
+	it('finds a loading indicator above the first turn only', () => {
+		document.body.innerHTML = '<div role="status"></div><div data-turn-key="a"></div>';
+		expect(hasHistoryLoader(document)).toBe(true);
+		document.body.innerHTML = '<div data-turn-key="a"></div><form><div role="status"></div></form>';
+		expect(hasHistoryLoader(document)).toBe(false);
 	});
 });
 
